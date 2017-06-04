@@ -34,6 +34,7 @@
 Datum transform(PG_FUNCTION_ARGS);
 Datum transform_geom(PG_FUNCTION_ARGS);
 Datum postgis_proj_version(PG_FUNCTION_ARGS);
+Datum transform_to_webmercator(PG_FUNCTION_ARGS);
 
 
 
@@ -206,3 +207,112 @@ Datum postgis_proj_version(PG_FUNCTION_ARGS)
 	text *result = cstring2text(ver);
 	PG_RETURN_POINTER(result);
 }
+
+/**
+ * transform_to_webmercator( GEOMETRY )
+ */
+PG_FUNCTION_INFO_V1(transform_to_webmercator);
+Datum transform_to_webmercator(PG_FUNCTION_ARGS)
+{
+	GSERIALIZED *geom;
+	GSERIALIZED *result = NULL;
+	
+	LWGEOM *latlon_lwgeom = NULL;
+	LWGEOM *valid_extent = NULL;
+	LWGEOM *clipped_input = NULL;
+	LWPOLY *poly;
+
+	projPJ input_pj, output_pj;
+	int32 output_srid, input_srid;
+
+	geom = PG_GETARG_GSERIALIZED_P_COPY(0);
+	input_srid = gserialized_get_srid(geom);
+	if ( input_srid == SRID_UNKNOWN )
+	{
+		PG_FREE_IF_COPY(geom, 0);
+		elog(ERROR,"Input geometry has unknown (%d) SRID",SRID_UNKNOWN);
+		PG_RETURN_NULL();
+	}
+
+	/*
+	 * If input SRID is already Webmercator, return geometry without
+         * transform it
+	 */
+	if ( input_srid == 3857 )
+		PG_RETURN_POINTER(PG_GETARG_DATUM(0));
+
+	// valid web mercator extent	
+	poly = lwpoly_construct_envelope(4326, -180, -89, 180, 89);
+	valid_extent = lwpoly_as_lwgeom(poly);
+	lwpoly_free(poly);
+
+	if ( GetProjectionsUsingFCInfo(fcinfo, input_srid, 4326, &input_pj, &output_pj) == LW_FAILURE )
+	{
+		PG_FREE_IF_COPY(geom, 0);
+		elog(ERROR,"Failure reading projections from spatial_ref_sys.");
+		PG_RETURN_NULL();
+	}
+	
+	// now we have a geometry, and input/output PJ structs. Transform to
+	// WGS84 latlon.
+	latlon_lwgeom = lwgeom_from_gserialized(geom);
+	lwgeom_transform(latlon_lwgeom, input_pj, output_pj);
+	latlon_lwgeom->srid = output_srid;
+
+	// Re-compute bbox if input had one (COMPUTE_BBOX TAINTING) 
+	if ( latlon_lwgeom->bbox )
+	{
+		lwgeom_drop_bbox(latlon_lwgeom);
+		lwgeom_add_bbox(latlon_lwgeom);
+	}
+
+	int dimension = lwgeom_dimension(latlon_lwgeom);
+	if ( ( dimension != 0 ) && ( gserialized_get_type(geom) != COLLECTIONTYPE ) )
+	{
+		latlon_lwgeom = lwgeom_make_valid(latlon_lwgeom);
+		if ( ! latlon_lwgeom )
+		{
+			PG_FREE_IF_COPY(geom, 0);
+			lwgeom_free(valid_extent);
+			lwgeom_free(clipped_input);
+			PG_RETURN_NULL();
+		}
+
+		latlon_lwgeom = lwcollection_as_lwgeom(lwcollection_extract(
+			lwgeom_as_lwcollection(latlon_lwgeom), dimension + 1));
+	}
+
+	clipped_input = lwgeom_intersection(latlon_lwgeom, valid_extent);
+
+	if ( GetProjectionsUsingFCInfo(fcinfo, clipped_input->srid, 3857, &input_pj, &output_pj) == LW_FAILURE )
+	{
+		PG_FREE_IF_COPY(geom, 0);
+		elog(ERROR,"Failure reading projections from spatial_ref_sys.");
+		PG_RETURN_NULL();
+	}
+	lwgeom_transform(clipped_input, input_pj, output_pj);
+
+	if ( lwgeom_is_empty(clipped_input) )
+	{
+		PG_FREE_IF_COPY(geom, 0);
+		lwgeom_free(valid_extent);
+		lwgeom_free(clipped_input);
+		PG_RETURN_NULL();
+	}
+	
+	uint8_t type = lwgeom_get_type(clipped_input);
+	if( ( type == MULTIPOINTTYPE ) || ( type == MULTILINETYPE ) 
+		|| ( type == MULTICURVETYPE ) || ( type == MULTIPOLYGONTYPE )
+		|| ( type == MULTISURFACETYPE ) )
+	{
+		clipped_input = lwgeom_as_multi(clipped_input);
+	}
+
+	result = geometry_serialize(clipped_input);
+	lwgeom_free(valid_extent);
+	lwgeom_free(clipped_input);
+	PG_FREE_IF_COPY(geom, 0);
+
+	PG_RETURN_POINTER(result); 
+}
+
